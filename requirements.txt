@@ -1,2 +1,3 @@
 python-telegram-bot==20.7
 pymysql==1.1.0
+cryptography==42.0.8
