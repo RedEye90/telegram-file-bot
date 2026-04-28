@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,11 +19,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ["BOT_TOKEN"]          # set in Railway/Render env vars
-ADMIN_ID    = int(os.environ["ADMIN_ID"])      # your Telegram user ID (integer)
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+ADMIN_ID    = int(os.environ["ADMIN_ID"])
+FILE_DB     = "files.json"  # ✅ Persistent storage file
 
-# In-memory file store  { file_id: { "name": str, "type": "apk"|"zip", "file_id": str } }
-file_store: dict[str, dict] = {}
+
+# ─── Persistent Storage Functions ────────────────────────────────
+def load_file_store() -> dict:
+    """Load file store from disk."""
+    if os.path.exists(FILE_DB):
+        try:
+            with open(FILE_DB, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            logger.warning("files.json corrupt ya empty hai, fresh start...")
+            return {}
+    return {}
+
+
+def save_file_store():
+    """Save file store to disk."""
+    try:
+        with open(FILE_DB, "w") as f:
+            json.dump(file_store, f, indent=2)
+    except IOError as e:
+        logger.error("File save nahi hui: %s", e)
+
+
+# ✅ Bot start hote hi disk se load hoga
+file_store: dict[str, dict] = load_file_store()
 
 
 # ─── Helper ──────────────────────────────────────────────────────
@@ -90,6 +115,7 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fid = context.args[0]
     if fid in file_store:
         name = file_store.pop(fid)["name"]
+        save_file_store()  # ✅ Disk update karo
         await update.message.reply_text(f"✅ `{name}` delete ho gaya.", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ File ID nahi mili.")
@@ -136,9 +162,9 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Use Telegram's file_id as the key (stable, no re-upload needed)
     fid = doc.file_id
     file_store[fid] = {"name": fname, "type": ext, "file_id": fid}
+    save_file_store()  # ✅ Turant disk pe save karo
 
     await update.message.reply_text(
         f"✅ *{fname}* store ho gaya!\n\n"
@@ -187,13 +213,8 @@ def main():
     app.add_handler(CommandHandler("delete", delete_file))
     app.add_handler(CommandHandler("help",   help_cmd))
 
-    # Admin uploads (documents only)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_upload))
-
-    # Inline button taps (downloads)
     app.add_handler(CallbackQueryHandler(handle_download, pattern=r"^dl:"))
-
-    # Catch-all
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
 
     logger.info("Bot chal raha hai... 🚀")
