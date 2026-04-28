@@ -11,31 +11,27 @@ from telegram.ext import (
     filters,
 )
 
-# ─── Logging setup ───────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ─── Config ──────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID  = int(os.environ["ADMIN_ID"])
 MYSQL_URL = os.environ["MYSQL_URL"]
 
 
-# ─── MySQL Connection ─────────────────────────────────────────────
 def get_db():
     url = MYSQL_URL.replace("mysql://", "")
     user_pass, rest = url.split("@", 1)
-    user, password   = user_pass.split(":", 1)
+    user, password  = user_pass.split(":", 1)
     host_port, dbname = rest.split("/", 1)
     if ":" in host_port:
         host, port = host_port.split(":", 1)
         port = int(port)
     else:
         host, port = host_port, 3306
-
     return pymysql.connect(
         host=host, port=port,
         user=user, password=password,
@@ -50,7 +46,8 @@ def init_db():
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS files (
-                file_id VARCHAR(255) PRIMARY KEY,
+                id      INT AUTO_INCREMENT PRIMARY KEY,
+                file_id VARCHAR(255) NOT NULL,
                 name    VARCHAR(255) NOT NULL,
                 type    VARCHAR(10)  NOT NULL
             )
@@ -59,49 +56,48 @@ def init_db():
     logger.info("Database ready ✅")
 
 
-# ─── DB Helpers ──────────────────────────────────────────────────
 def db_save_file(file_id: str, name: str, ftype: str):
     conn = get_db()
     with conn.cursor() as cur:
-        cur.execute(
-            "REPLACE INTO files (file_id, name, type) VALUES (%s, %s, %s)",
-            (file_id, name, ftype)
-        )
+        # Avoid duplicates
+        cur.execute("SELECT id FROM files WHERE file_id = %s", (file_id,))
+        if not cur.fetchone():
+            cur.execute(
+                "INSERT INTO files (file_id, name, type) VALUES (%s, %s, %s)",
+                (file_id, name, ftype)
+            )
     conn.close()
 
 
-def db_get_all_files() -> dict:
+def db_get_all_files() -> list:
     conn = get_db()
     with conn.cursor() as cur:
-        cur.execute("SELECT file_id, name, type FROM files")
+        cur.execute("SELECT id, file_id, name, type FROM files")
         rows = cur.fetchall()
     conn.close()
-    return {row["file_id"]: {"name": row["name"], "type": row["type"], "file_id": row["file_id"]} for row in rows}
+    return rows  # list of dicts
 
 
-def db_get_file(file_id: str):
+def db_get_file_by_id(row_id: int) -> dict | None:
     conn = get_db()
     with conn.cursor() as cur:
-        cur.execute("SELECT file_id, name, type FROM files WHERE file_id = %s", (file_id,))
+        cur.execute("SELECT id, file_id, name, type FROM files WHERE id = %s", (row_id,))
         row = cur.fetchone()
     conn.close()
-    if row:
-        return {"name": row["name"], "type": row["type"], "file_id": row["file_id"]}
-    return None
+    return row
 
 
-def db_delete_file(file_id: str):
-    meta = db_get_file(file_id)
+def db_delete_file(row_id: int):
+    meta = db_get_file_by_id(row_id)
     if not meta:
         return None
     conn = get_db()
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM files WHERE file_id = %s", (file_id,))
+        cur.execute("DELETE FROM files WHERE id = %s", (row_id,))
     conn.close()
     return meta["name"]
 
 
-# ─── Helper ──────────────────────────────────────────────────────
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
@@ -111,13 +107,13 @@ def build_file_list_keyboard():
     if not files:
         return None
     buttons = [
-        [InlineKeyboardButton(f"📦 {meta['name']}", callback_data=f"dl:{fid}")]
-        for fid, meta in files.items()
+        # ✅ callback_data uses short int id — well within 64 byte limit
+        [InlineKeyboardButton(f"📦 {row['name']}", callback_data=f"dl:{row['id']}")]
+        for row in files
     ]
     return InlineKeyboardMarkup(buttons)
 
 
-# ─── /start ──────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     keyboard = build_file_list_keyboard()
@@ -134,7 +130,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ─── /list ───────────────────────────────────────────────────────
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = build_file_list_keyboard()
     if keyboard:
@@ -143,7 +138,6 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Koi file upload nahi hui abhi tak.")
 
 
-# ─── /delete (admin only) ────────────────────────────────────────
 async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Sirf admin yeh kar sakta hai.")
@@ -154,29 +148,33 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not files:
             await update.message.reply_text("Koi file nahi hai.")
             return
-        lines = [f"`{fid}` — {meta['name']}" for fid, meta in files.items()]
+        lines = [f"`{row['id']}` — {row['name']}" for row in files]
         await update.message.reply_text(
-            "Delete karne ke liye:\n`/delete <file_id>`\n\n" + "\n".join(lines),
+            "Delete karne ke liye:\n`/delete <id>`\n\n" + "\n".join(lines),
             parse_mode="Markdown",
         )
         return
 
-    fid  = context.args[0]
-    name = db_delete_file(fid)
+    try:
+        row_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID number hona chahiye.")
+        return
+
+    name = db_delete_file(row_id)
     if name:
         await update.message.reply_text(f"✅ `{name}` delete ho gaya.", parse_mode="Markdown")
     else:
-        await update.message.reply_text("❌ File ID nahi mili.")
+        await update.message.reply_text("❌ ID nahi mili.")
 
 
-# ─── /help ───────────────────────────────────────────────────────
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
         text = (
             "🛠 *Admin Commands*\n\n"
             "📤 *File upload* — Mujhe seedha APK/ZIP bhejo, main store kar lunga\n"
             "/list — Sab files dekho\n"
-            "/delete `<file_id>` — Koi file hatao\n"
+            "/delete `<id>` — Koi file hatao\n"
             "/help — Yeh message"
         )
     else:
@@ -189,7 +187,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# ─── Admin: receive APK / ZIP uploads ────────────────────────────
 async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Sirf admin files upload kar sakta hai.")
@@ -206,25 +203,22 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Sirf .apk aur .zip files accept hoti hain.")
         return
 
-    fid = doc.file_id
-    db_save_file(fid, fname, ext)  # ✅ MySQL mein save
+    db_save_file(doc.file_id, fname, ext)
 
     await update.message.reply_text(
         f"✅ *{fname}* store ho gaya!\n\n"
-        f"File ID: `{fid}`\n"
         f"Users ab /list se download kar sakte hain. 🎉",
         parse_mode="Markdown",
     )
-    logger.info("Admin uploaded: %s (%s)", fname, fid)
+    logger.info("Admin uploaded: %s", fname)
 
 
-# ─── User: button tap → send file ────────────────────────────────
 async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    _, fid = query.data.split(":", 1)
-    meta   = db_get_file(fid)
+    _, row_id_str = query.data.split(":", 1)
+    meta = db_get_file_by_id(int(row_id_str))
 
     if not meta:
         await query.edit_message_text("❌ File nahi mili. Shayad delete ho gayi.")
@@ -238,16 +232,14 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("User %s downloaded %s", query.from_user.id, meta["name"])
 
 
-# ─── Unknown messages ─────────────────────────────────────────────
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Samajh nahi aaya 🤔\n/help likho commands dekhne ke liye."
     )
 
 
-# ─── Main ────────────────────────────────────────────────────────
 def main():
-    init_db()  # ✅ Table create karo agar nahi hai
+    init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
