@@ -1,6 +1,7 @@
 import os
 import logging
 import pymysql
+import pymysql.cursors
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -22,8 +23,8 @@ ADMIN_ID  = int(os.environ["ADMIN_ID"])
 MYSQL_URL = os.environ["MYSQL_URL"]
 
 
-def get_db():
-    url = MYSQL_URL.replace("mysql://", "")
+def parse_mysql_url(url: str) -> dict:
+    url = url.replace("mysql://", "")
     user_pass, rest = url.split("@", 1)
     user, password  = user_pass.split(":", 1)
     host_port, dbname = rest.split("/", 1)
@@ -32,69 +33,79 @@ def get_db():
         port = int(port)
     else:
         host, port = host_port, 3306
+    return dict(host=host, port=port, user=user, password=password, database=dbname)
+
+
+DB_CFG = parse_mysql_url(MYSQL_URL)
+
+
+def get_db():
+    """Always return a fresh connection."""
     return pymysql.connect(
-        host=host, port=port,
-        user=user, password=password,
-        database=dbname,
+        **DB_CFG,
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
+        connect_timeout=10,
     )
 
 
+def run_query(sql: str, args=None, fetch: str = "none"):
+    """Run a query with automatic retry on lost connection."""
+    for attempt in range(3):
+        conn = None
+        try:
+            conn = get_db()
+            with conn.cursor() as cur:
+                cur.execute(sql, args or ())
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+                return None
+        except pymysql.err.OperationalError as e:
+            logger.warning("DB error attempt %d: %s", attempt + 1, e)
+            if attempt == 2:
+                raise
+        finally:
+            if conn:
+                conn.close()
+
+
 def init_db():
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS files (
-                id      INT AUTO_INCREMENT PRIMARY KEY,
-                file_id VARCHAR(255) NOT NULL,
-                name    VARCHAR(255) NOT NULL,
-                type    VARCHAR(10)  NOT NULL
-            )
-        """)
-    conn.close()
+    run_query("""
+        CREATE TABLE IF NOT EXISTS files (
+            id      INT AUTO_INCREMENT PRIMARY KEY,
+            file_id VARCHAR(255) NOT NULL UNIQUE,
+            name    VARCHAR(255) NOT NULL,
+            type    VARCHAR(10)  NOT NULL
+        )
+    """)
     logger.info("Database ready ✅")
 
 
 def db_save_file(file_id: str, name: str, ftype: str):
-    conn = get_db()
-    with conn.cursor() as cur:
-        # Avoid duplicates
-        cur.execute("SELECT id FROM files WHERE file_id = %s", (file_id,))
-        if not cur.fetchone():
-            cur.execute(
-                "INSERT INTO files (file_id, name, type) VALUES (%s, %s, %s)",
-                (file_id, name, ftype)
-            )
-    conn.close()
+    run_query(
+        "INSERT IGNORE INTO files (file_id, name, type) VALUES (%s, %s, %s)",
+        (file_id, name, ftype)
+    )
 
 
 def db_get_all_files() -> list:
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, file_id, name, type FROM files")
-        rows = cur.fetchall()
-    conn.close()
-    return rows  # list of dicts
+    return run_query("SELECT id, file_id, name, type FROM files", fetch="all") or []
 
 
-def db_get_file_by_id(row_id: int) -> dict | None:
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, file_id, name, type FROM files WHERE id = %s", (row_id,))
-        row = cur.fetchone()
-    conn.close()
-    return row
+def db_get_file_by_id(row_id: int):
+    return run_query(
+        "SELECT id, file_id, name, type FROM files WHERE id = %s",
+        (row_id,), fetch="one"
+    )
 
 
 def db_delete_file(row_id: int):
     meta = db_get_file_by_id(row_id)
     if not meta:
         return None
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM files WHERE id = %s", (row_id,))
-    conn.close()
+    run_query("DELETE FROM files WHERE id = %s", (row_id,))
     return meta["name"]
 
 
@@ -107,7 +118,6 @@ def build_file_list_keyboard():
     if not files:
         return None
     buttons = [
-        # ✅ callback_data uses short int id — well within 64 byte limit
         [InlineKeyboardButton(f"📦 {row['name']}", callback_data=f"dl:{row['id']}")]
         for row in files
     ]
@@ -207,7 +217,7 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ *{fname}* store ho gaya!\n\n"
-        f"Users ab /list se download kar sakte hain. 🎉",
+        "Users ab /list se download kar sakte hain. 🎉",
         parse_mode="Markdown",
     )
     logger.info("Admin uploaded: %s", fname)
