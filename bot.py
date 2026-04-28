@@ -1,6 +1,6 @@
 import os
-import json
 import logging
+import pymysql
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -19,35 +19,86 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-ADMIN_ID    = int(os.environ["ADMIN_ID"])
-FILE_DB     = "files.json"  # ✅ Persistent storage file
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID  = int(os.environ["ADMIN_ID"])
+MYSQL_URL = os.environ["MYSQL_URL"]
 
 
-# ─── Persistent Storage Functions ────────────────────────────────
-def load_file_store() -> dict:
-    """Load file store from disk."""
-    if os.path.exists(FILE_DB):
-        try:
-            with open(FILE_DB, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            logger.warning("files.json corrupt ya empty hai, fresh start...")
-            return {}
-    return {}
+# ─── MySQL Connection ─────────────────────────────────────────────
+def get_db():
+    url = MYSQL_URL.replace("mysql://", "")
+    user_pass, rest = url.split("@", 1)
+    user, password   = user_pass.split(":", 1)
+    host_port, dbname = rest.split("/", 1)
+    if ":" in host_port:
+        host, port = host_port.split(":", 1)
+        port = int(port)
+    else:
+        host, port = host_port, 3306
+
+    return pymysql.connect(
+        host=host, port=port,
+        user=user, password=password,
+        database=dbname,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
+    )
 
 
-def save_file_store():
-    """Save file store to disk."""
-    try:
-        with open(FILE_DB, "w") as f:
-            json.dump(file_store, f, indent=2)
-    except IOError as e:
-        logger.error("File save nahi hui: %s", e)
+def init_db():
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                file_id VARCHAR(255) PRIMARY KEY,
+                name    VARCHAR(255) NOT NULL,
+                type    VARCHAR(10)  NOT NULL
+            )
+        """)
+    conn.close()
+    logger.info("Database ready ✅")
 
 
-# ✅ Bot start hote hi disk se load hoga
-file_store: dict[str, dict] = load_file_store()
+# ─── DB Helpers ──────────────────────────────────────────────────
+def db_save_file(file_id: str, name: str, ftype: str):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "REPLACE INTO files (file_id, name, type) VALUES (%s, %s, %s)",
+            (file_id, name, ftype)
+        )
+    conn.close()
+
+
+def db_get_all_files() -> dict:
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT file_id, name, type FROM files")
+        rows = cur.fetchall()
+    conn.close()
+    return {row["file_id"]: {"name": row["name"], "type": row["type"], "file_id": row["file_id"]} for row in rows}
+
+
+def db_get_file(file_id: str):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT file_id, name, type FROM files WHERE file_id = %s", (file_id,))
+        row = cur.fetchone()
+    conn.close()
+    if row:
+        return {"name": row["name"], "type": row["type"], "file_id": row["file_id"]}
+    return None
+
+
+def db_delete_file(file_id: str):
+    meta = db_get_file(file_id)
+    if not meta:
+        return None
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM files WHERE file_id = %s", (file_id,))
+    conn.close()
+    return meta["name"]
 
 
 # ─── Helper ──────────────────────────────────────────────────────
@@ -56,12 +107,12 @@ def is_admin(user_id: int) -> bool:
 
 
 def build_file_list_keyboard():
-    """Build inline keyboard listing all uploaded files."""
-    if not file_store:
+    files = db_get_all_files()
+    if not files:
         return None
     buttons = [
         [InlineKeyboardButton(f"📦 {meta['name']}", callback_data=f"dl:{fid}")]
-        for fid, meta in file_store.items()
+        for fid, meta in files.items()
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -70,7 +121,6 @@ def build_file_list_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     keyboard = build_file_list_keyboard()
-
     if keyboard:
         await update.message.reply_text(
             f"👋 Namaste {user.first_name}!\n\n"
@@ -88,9 +138,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = build_file_list_keyboard()
     if keyboard:
-        await update.message.reply_text(
-            "📂 Available files:", reply_markup=keyboard
-        )
+        await update.message.reply_text("📂 Available files:", reply_markup=keyboard)
     else:
         await update.message.reply_text("❌ Koi file upload nahi hui abhi tak.")
 
@@ -102,20 +150,20 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args:
-        if not file_store:
+        files = db_get_all_files()
+        if not files:
             await update.message.reply_text("Koi file nahi hai.")
             return
-        lines = [f"`{fid}` — {meta['name']}" for fid, meta in file_store.items()]
+        lines = [f"`{fid}` — {meta['name']}" for fid, meta in files.items()]
         await update.message.reply_text(
             "Delete karne ke liye:\n`/delete <file_id>`\n\n" + "\n".join(lines),
             parse_mode="Markdown",
         )
         return
 
-    fid = context.args[0]
-    if fid in file_store:
-        name = file_store.pop(fid)["name"]
-        save_file_store()  # ✅ Disk update karo
+    fid  = context.args[0]
+    name = db_delete_file(fid)
+    if name:
         await update.message.reply_text(f"✅ `{name}` delete ho gaya.", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ File ID nahi mili.")
@@ -144,9 +192,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Admin: receive APK / ZIP uploads ────────────────────────────
 async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "🚫 Sirf admin files upload kar sakta hai."
-        )
+        await update.message.reply_text("🚫 Sirf admin files upload kar sakta hai.")
         return
 
     doc = update.message.document
@@ -157,14 +203,11 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ext   = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
 
     if ext not in ("apk", "zip"):
-        await update.message.reply_text(
-            "⚠️ Sirf .apk aur .zip files accept hoti hain."
-        )
+        await update.message.reply_text("⚠️ Sirf .apk aur .zip files accept hoti hain.")
         return
 
     fid = doc.file_id
-    file_store[fid] = {"name": fname, "type": ext, "file_id": fid}
-    save_file_store()  # ✅ Turant disk pe save karo
+    db_save_file(fid, fname, ext)  # ✅ MySQL mein save
 
     await update.message.reply_text(
         f"✅ *{fname}* store ho gaya!\n\n"
@@ -181,7 +224,7 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     _, fid = query.data.split(":", 1)
-    meta   = file_store.get(fid)
+    meta   = db_get_file(fid)
 
     if not meta:
         await query.edit_message_text("❌ File nahi mili. Shayad delete ho gayi.")
@@ -192,9 +235,7 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📦 *{meta['name']}*\n\nEnjoy! 🚀",
         parse_mode="Markdown",
     )
-    logger.info(
-        "User %s downloaded %s", query.from_user.id, meta["name"]
-    )
+    logger.info("User %s downloaded %s", query.from_user.id, meta["name"])
 
 
 # ─── Unknown messages ─────────────────────────────────────────────
@@ -206,13 +247,14 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Main ────────────────────────────────────────────────────────
 def main():
+    init_db()  # ✅ Table create karo agar nahi hai
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("list",   list_files))
     app.add_handler(CommandHandler("delete", delete_file))
     app.add_handler(CommandHandler("help",   help_cmd))
-
     app.add_handler(MessageHandler(filters.Document.ALL, handle_upload))
     app.add_handler(CallbackQueryHandler(handle_download, pattern=r"^dl:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
