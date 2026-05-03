@@ -223,12 +223,23 @@ def build_file_list_keyboard() -> InlineKeyboardMarkup | None:
     if not files:
         return None
     buttons = [
-        [
-            InlineKeyboardButton(f"📦 {row['name']}", callback_data=f"dl:{row['id']}"),
-            InlineKeyboardButton("🛒 Buy",            callback_data=f"buy:{row['id']}"),
-        ]
+        [InlineKeyboardButton(f"📦 {row['name']}", callback_data=f"dl:{row['id']}")]
         for row in files
     ]
+    buttons.append([InlineKeyboardButton("🛒 Buy", callback_data="buyall")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_buy_file_keyboard() -> InlineKeyboardMarkup | None:
+    """Buy flow ke liye file selection keyboard."""
+    files = db_get_all_files()
+    if not files:
+        return None
+    buttons = [
+        [InlineKeyboardButton(f"📦 {row['name']}", callback_data=f"buy:{row['id']}")]
+        for row in files
+    ]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -262,12 +273,29 @@ async def _forward_or_copy(context: ContextTypes.DEFAULT_TYPE, msg, target_uid: 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+
+    # Admin ko user details bhejo
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"👤 *New User Started Bot*\n\n"
+                f"🆔 User ID: `{user.id}`\n"
+                f"👤 Name: {user.full_name}\n"
+                f"📛 Username: @{user.username or 'N/A'}\n"
+                f"🌐 Language: {user.language_code or 'N/A'}"
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("Admin notify failed: %s", e)
+
     keyboard = build_file_list_keyboard()
     if keyboard:
         await update.message.reply_text(
             f"👋 Namaste {user.first_name}!\n\n"
             "Neeche available files hain.\n"
-            "📦 Download karo ya 🛒 Buy karo 👇",
+            "🛒 Buy karo 👇",
             reply_markup=keyboard,
         )
     else:
@@ -513,6 +541,21 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     logger.info("User %s downloaded %s", query.from_user.id, meta["name"])
+
+
+async def handle_buyall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🛒 Standalone Buy button — pehle file select karo."""
+    query = update.callback_query
+    await query.answer()
+    keyboard = build_buy_file_keyboard()
+    if not keyboard:
+        await query.answer("❌ Koi file available nahi hai.", show_alert=True)
+        return
+    await query.message.reply_text(
+        "🛒 *Kaunsi file khareedni hai?*\n\nFile chuno 👇",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
 
 
 async def handle_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -852,6 +895,7 @@ def main():
 
     # ── Inline button callbacks ───────────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(handle_download,       pattern=r"^dl:"))
+    app.add_handler(CallbackQueryHandler(handle_buyall,          pattern=r"^buyall$"))
     app.add_handler(CallbackQueryHandler(handle_buy,            pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(handle_service_select, pattern=r"^svc:"))
     app.add_handler(CallbackQueryHandler(handle_cancel_callback, pattern=r"^cancel$"))
