@@ -544,16 +544,17 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_buyall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """🛒 Standalone Buy button — pehle file select karo."""
+    """🛒 Standalone Buy button — seedha service options dikhao."""
     query = update.callback_query
     await query.answer()
-    keyboard = build_buy_file_keyboard()
-    if not keyboard:
-        await query.answer("❌ Koi file available nahi hai.", show_alert=True)
-        return
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"svc:{key}:0")]
+        for key, name in SERVICES.items()
+    ]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
     await query.message.reply_text(
-        "🛒 *Kaunsi file khareedni hai?*\n\nFile chuno 👇",
-        reply_markup=keyboard,
+        "🛒 *Kaunsi service chahiye?*",
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown",
     )
 
@@ -596,7 +597,7 @@ async def handle_service_select(update: Update, context: ContextTypes.DEFAULT_TY
     set_user_state(context, user_id,
                    state="awaiting_screenshot",
                    service=service,
-                   file_row_id=int(row_id_str))
+                   file_row_id=int(row_id_str) if row_id_str != '0' else None)
 
     await query.message.reply_text(
         f"💳 *{svc_name}* — Payment Process\n\n"
